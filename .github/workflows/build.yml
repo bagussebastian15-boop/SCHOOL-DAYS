@@ -1,62 +1,106 @@
-name: Bangun APK terjemahan
+name: Build APK School Days (Indonesia)
 
 on:
+  push:
+    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
-    inputs:
-      apk_url:
-        description: "(Opsional) tautan langsung ke APK asli. Kosongkan jika APK sudah dipasang sebagai aset Release bertag 'sumber'."
-        required: false
-        default: ""
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Ambil kode
+        uses: actions/checkout@v4
 
-      - name: Ambil APK asli
-        env:
-          GH_TOKEN: ${{ github.token }}
-          APK_URL: ${{ inputs.apk_url }}
-        run: |
-          if [ -n "$APK_URL" ]; then
-            curl -L --fail -o asli.apk "$APK_URL"
-          else
-            gh release download sumber --pattern '*.apk' --output asli.apk
-          fi
-          ls -l asli.apk
-
-      - name: Terapkan terjemahan
-        run: python3 patch.py asli.apk unsigned.apk
-
-      - name: Keystore (stabil antar build)
-        uses: actions/cache@v4
+      - name: Siapkan Java
+        uses: actions/setup-java@v4
         with:
-          path: ks.jks
-          key: keystore-school-days-v1
+          distribution: temurin
+          java-version: '17'
 
-      - name: Buat keystore bila belum ada
-        env:
-          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+      - name: Susun ulang isi APK
         run: |
-          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > ks.jks; fi
-          if [ ! -f ks.jks ]; then
-            keytool -genkeypair -keystore ks.jks -storepass sdindo123 -keypass sdindo123 \
-              -alias sd -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=School Days ID"
+          set -euo pipefail
+
+          # Folder sumber: bisa "school_days/" atau langsung di root repo
+          if [ -f school_days/AndroidManifest.xml ]; then SRC=school_days; else SRC=.; fi
+
+          rm -rf build && mkdir -p build/apk
+          cp "$SRC/AndroidManifest.xml" "$SRC/classes.dex" "$SRC/resources.arsc" build/apk/
+
+          # Zip bagian (assets, lib, res, META-INF) dibuka kembali ke akar APK
+          for z in META-INF assets lib res; do
+            unzip -q -o "$SRC/$z.zip" -d build/apk
+          done
+
+          # Buang tanda tangan lama, nanti ditandatangani ulang
+          rm -f build/apk/META-INF/*.SF build/apk/META-INF/*.RSA \
+                build/apk/META-INF/*.DSA build/apk/META-INF/*.EC \
+                build/apk/META-INF/MANIFEST.MF
+
+          # Timpa dengan berkas terjemahan (opsional): isi folder terjemahan/
+          # mengikuti struktur APK, contoh: terjemahan/assets/Game.swf
+          if [ -d terjemahan ]; then
+            cp -rT terjemahan build/apk
+            echo "Berkas terjemahan diterapkan:"
+            (cd terjemahan && find . -type f)
           fi
 
-      - name: Align dan tanda tangani
-        env:
-          KS_PASS: ${{ secrets.KEYSTORE_PASS }}
+      - name: Kemas jadi APK
         run: |
-          BT="$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)"
-          PASS="${KS_PASS:-sdindo123}"
-          "$BT/zipalign" -f -p 4 unsigned.apk aligned.apk
-          "$BT/apksigner" sign --ks ks.jks --ks-key-alias "${KS_ALIAS:-sd}" \
-            --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --out SchoolDays-ID.apk aligned.apk
-          "$BT/apksigner" verify SchoolDays-ID.apk
+          set -euo pipefail
+          cd build/apk
+          # resources.arsc dan .so harus tidak dikompres
+          zip -X -0 -r ../unaligned.apk resources.arsc lib
+          zip -X -9 -r ../unaligned.apk . -x resources.arsc 'lib/*'
 
-      - uses: actions/upload-artifact@v4
+      - name: Zipalign
+        run: |
+          set -euo pipefail
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          "$BT/zipalign" -f -p 4 build/unaligned.apk build/aligned.apk
+
+      - name: Siapkan keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > build/release.jks
+            echo "KS_PASS=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=key" >> "$GITHUB_ENV"
+          else
+            echo "Secret keystore tidak ada, membuat keystore sementara."
+            keytool -genkeypair -keystore build/release.jks -storepass android \
+              -keypass android -alias key -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=School Days ID"
+            echo "KS_PASS=android" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=key" >> "$GITHUB_ENV"
+          fi
+
+      - name: Tanda tangan APK
+        run: |
+          set -euo pipefail
+          "$BT/apksigner" sign \
+            --ks build/release.jks --ks-key-alias "$KS_ALIAS" \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+            --out SchoolDays-ID.apk build/aligned.apk
+          "$BT/apksigner" verify --verbose SchoolDays-ID.apk
+
+      - name: Unggah hasil build
+        uses: actions/upload-artifact@v4
         with:
           name: SchoolDays-ID
           path: SchoolDays-ID.apk
+
+      - name: Buat rilis (khusus tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SchoolDays-ID.apk
