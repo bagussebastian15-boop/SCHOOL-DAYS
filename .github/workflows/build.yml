@@ -1,0 +1,62 @@
+name: Bangun APK terjemahan
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "(Opsional) tautan langsung ke APK asli. Kosongkan jika APK sudah dipasang sebagai aset Release bertag 'sumber'."
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ambil APK asli
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK_URL: ${{ inputs.apk_url }}
+        run: |
+          if [ -n "$APK_URL" ]; then
+            curl -L --fail -o asli.apk "$APK_URL"
+          else
+            gh release download sumber --pattern '*.apk' --output asli.apk
+          fi
+          ls -l asli.apk
+
+      - name: Terapkan terjemahan
+        run: python3 patch.py asli.apk unsigned.apk
+
+      - name: Keystore (stabil antar build)
+        uses: actions/cache@v4
+        with:
+          path: ks.jks
+          key: keystore-school-days-v1
+
+      - name: Buat keystore bila belum ada
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > ks.jks; fi
+          if [ ! -f ks.jks ]; then
+            keytool -genkeypair -keystore ks.jks -storepass sdindo123 -keypass sdindo123 \
+              -alias sd -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=School Days ID"
+          fi
+
+      - name: Align dan tanda tangani
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASS }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)"
+          PASS="${KS_PASS:-sdindo123}"
+          "$BT/zipalign" -f -p 4 unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks ks.jks --ks-key-alias "${KS_ALIAS:-sd}" \
+            --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --out SchoolDays-ID.apk aligned.apk
+          "$BT/apksigner" verify SchoolDays-ID.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SchoolDays-ID
+          path: SchoolDays-ID.apk
