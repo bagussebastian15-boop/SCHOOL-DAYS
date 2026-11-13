@@ -1,106 +1,127 @@
-name: Build APK School Days (Indonesia)
+name: build
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Ambil kode
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Siapkan Java
-        uses: actions/setup-java@v4
+      # Proyek bisa ada di root repo, atau repo hanya berisi EmulatorAllInOne.zip (diekstrak ke _project).
+      - name: Siapkan proyek
+        run: |
+          set -euo pipefail
+          if [ ! -f settings.gradle.kts ]; then
+            Z="$(ls -1 *EmulatorAllInOne*.zip 2>/dev/null | head -n1 || true)"
+            [ -z "$Z" ] && Z="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
+            if [ -n "$Z" ]; then
+              echo "Mengekstrak $Z ke _project"
+              rm -rf _project && mkdir _project && unzip -q "$Z" -d _project
+            fi
+          fi
+          S="$(find . -name settings.gradle.kts -not -path '*/node_modules/*' | head -n1)"
+          [ -z "$S" ] && { echo "settings.gradle.kts tidak ditemukan"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$S")" >> "$GITHUB_ENV"
+          echo "Proyek: $(dirname "$S")"
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: 17
 
-      - name: Susun ulang isi APK
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Terima lisensi Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # Core NDS SeedlessDS dikompilasi native (CMake): butuh NDK 25.2 + CMake 3.22. CMake juga mengunduh libarchive/unarr/LZMA
+      # (diverifikasi SHA-256), jadi langkah ini dan build butuh internet.
+      - name: Pasang NDK + CMake (core SeedlessDS)
         run: |
           set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;25.2.9519653" "cmake;3.22.1" > /dev/null
+          ls "$ANDROID_HOME/ndk" "$ANDROID_HOME/cmake"
 
-          # Folder sumber: bisa "school_days/" atau langsung di root repo
-          if [ -f school_days/AndroidManifest.xml ]; then SRC=school_days; else SRC=.; fi
+      # LibretroDroid dibangun dari sumber dengan patch multiplayer rollback (netplay).
+      - name: Siapkan LibretroDroid + netplay
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: bash scripts/setup_libretrodroid_netplay.sh
 
-          rm -rf build && mkdir -p build/apk
-          cp "$SRC/AndroidManifest.xml" "$SRC/classes.dex" "$SRC/resources.arsc" build/apk/
+      # Uji cepat (tanpa Android): logika rollback netplay dan server lobby (penandaan ZeroTier/Tailscale/LAN).
+      - name: Uji netplay + lobby
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          bash tests/run_netplay_test.sh
+          python3 tests/lobby_server_test.py
+          bash tests/run_ethbridge_test.sh
+          bash tests/run_ztdiscovery_test.sh
+          bash tests/run_ztengine_test.sh
 
-          # Zip bagian (assets, lib, res, META-INF) dibuka kembali ke akar APK
-          for z in META-INF assets lib res; do
-            unzip -q -o "$SRC/$z.zip" -d build/apk
+      # Mengunduh SEMUA core libretro (build Android) dari buildbot resmi.
+      # Core wajib harus berhasil; core arcade tambahan opsional (dilewati bila tidak ada di buildbot).
+      - name: Unduh core libretro
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          ABIS="arm64-v8a armeabi-v7a" REFRESH="fbneo mame2010 mame2003_plus mame2003 mame2000 fbalpha2012 desmume melonds" bash scripts/fetch_cores.sh
+
+      - name: Laporan core yang ikut di APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Core libretro di APK"
+            for abi in arm64-v8a armeabi-v7a; do
+              echo "### $abi"
+              ls -1 "app/src/main/jniLibs/$abi" 2>/dev/null | sed 's/^lib//; s/_libretro_android.so$//; s/^/- /' || true
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          for c in mgba snes9x genesis_plus_gx mame2010 fbneo; do
+            for abi in arm64-v8a armeabi-v7a; do
+              [ -s "app/src/main/jniLibs/$abi/lib${c}_libretro_android.so" ] || { echo "Core wajib hilang: $abi/$c"; exit 1; }
+            done
           done
 
-          # Buang tanda tangan lama, nanti ditandatangani ulang
-          rm -f build/apk/META-INF/*.SF build/apk/META-INF/*.RSA \
-                build/apk/META-INF/*.DSA build/apk/META-INF/*.EC \
-                build/apk/META-INF/MANIFEST.MF
+      # Mesin ZeroTier tertanam (VPN di dalam aplikasi). OPSIONAL: bila gagal, APK tetap dibuild tanpa ZeroTier tertanam.
+      - name: Siapkan mesin ZeroTier (opsional)
+        id: zt
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: bash scripts/setup_zerotier_core.sh
 
-          # Timpa dengan berkas terjemahan (opsional): isi folder terjemahan/
-          # mengikuti struktur APK, contoh: terjemahan/assets/Game.swf
-          if [ -d terjemahan ]; then
-            cp -rT terjemahan build/apk
-            echo "Berkas terjemahan diterapkan:"
-            (cd terjemahan && find . -type f)
-          fi
-
-      - name: Kemas jadi APK
+      - name: Build APK debug
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -euo pipefail
-          cd build/apk
-          # resources.arsc dan .so harus tidak dikompres
-          zip -X -0 -r ../unaligned.apk resources.arsc lib
-          zip -X -9 -r ../unaligned.apk . -x resources.arsc 'lib/*'
-
-      - name: Zipalign
-        run: |
-          set -euo pipefail
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          echo "BT=$BT" >> "$GITHUB_ENV"
-          "$BT/zipalign" -f -p 4 build/unaligned.apk build/aligned.apk
-
-      - name: Siapkan keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [ -n "${KEYSTORE_BASE64:-}" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > build/release.jks
-            echo "KS_PASS=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-            echo "KS_ALIAS=key" >> "$GITHUB_ENV"
+          set -uo pipefail
+          if [ "${{ steps.zt.outcome }}" = "success" ]; then
+            if gradle assembleDebug --stacktrace -Dorg.gradle.jvmargs="-Xmx4g"; then
+              echo "### ZeroTier tertanam: YA" >> "$GITHUB_STEP_SUMMARY"; exit 0
+            fi
+            echo "::warning::Build dengan ZeroTier tertanam gagal; mengulang tanpa ZeroTier (lihat log di atas dan artifact zerotier-api)."
+            echo "### ZeroTier tertanam: TIDAK (sumber SDK ZeroTier gagal dikompilasi; lihat log)" >> "$GITHUB_STEP_SUMMARY"
+            gradle assembleDebug --stacktrace -PnoZt=true -Dorg.gradle.jvmargs="-Xmx4g"
           else
-            echo "Secret keystore tidak ada, membuat keystore sementara."
-            keytool -genkeypair -keystore build/release.jks -storepass android \
-              -keypass android -alias key -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=School Days ID"
-            echo "KS_PASS=android" >> "$GITHUB_ENV"
-            echo "KS_ALIAS=key" >> "$GITHUB_ENV"
+            echo "### ZeroTier tertanam: TIDAK (setup_zerotier_core.sh gagal; lihat langkah sebelumnya)" >> "$GITHUB_STEP_SUMMARY"
+            gradle assembleDebug --stacktrace -PnoZt=true -Dorg.gradle.jvmargs="-Xmx4g"
           fi
 
-      - name: Tanda tangan APK
-        run: |
-          set -euo pipefail
-          "$BT/apksigner" sign \
-            --ks build/release.jks --ks-key-alias "$KS_ALIAS" \
-            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
-            --out SchoolDays-ID.apk build/aligned.apk
-          "$BT/apksigner" verify --verbose SchoolDays-ID.apk
-
-      - name: Unggah hasil build
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: SchoolDays-ID
-          path: SchoolDays-ID.apk
+          name: zerotier-api
+          path: ${{ env.PROJECT_DIR }}/zerotier-api/
+          if-no-files-found: ignore
+          retention-days: 3
 
-      - name: Buat rilis (khusus tag v*)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: SchoolDays-ID.apk
+          name: EmulatorAllInOne-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          retention-days: 3
